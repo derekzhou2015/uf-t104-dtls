@@ -117,6 +117,9 @@ type incomingPacketState struct {
 	number            protocol.RecordNumber
 	markPacketAsValid func() bool
 	originalCID       bool
+	// replayedHandshake marks a handshake record dropped by the replay window
+	// that the handshake FSM must still learn about for last-flight recovery.
+	replayedHandshake bool
 }
 
 type packetOutcome struct {
@@ -126,6 +129,7 @@ type packetOutcome struct {
 	clientHelloRetransmit bool
 	receivedACK           *protocol.ACK
 	responseAlert         *alert.Alert
+	replayedHandshake     *protocol.RecordNumber
 }
 
 type datagramProcessingSummary struct {
@@ -134,6 +138,7 @@ type datagramProcessingSummary struct {
 	retransmitStart       bool
 	clientHelloRetransmit bool
 	receivedACKs          []protocol.ACK
+	replayedHandshake     []protocol.RecordNumber
 }
 
 type readLoopErrorAction uint8
@@ -1787,7 +1792,7 @@ func (c *Conn) readAndBuffer(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if !summary.containsHandshake && len(summary.receivedACKs) == 0 {
+	if !summary.containsHandshake && len(summary.receivedACKs) == 0 && len(summary.replayedHandshake) == 0 {
 		c.signalHandshakeQuiescent()
 
 		return nil
@@ -1796,11 +1801,14 @@ func (c *Conn) readAndBuffer(ctx context.Context) error {
 	received := dtlshandshake.RecvHandshakeState{
 		Done:                    make(chan struct{}),
 		HasHandshake:            summary.containsHandshake,
-		IsRetransmit:            summary.retransmit,
+		IsRetransmit:            summary.retransmit || len(summary.replayedHandshake) != 0,
 		IsRetransmitStart:       summary.retransmitStart,
 		IsClientHelloRetransmit: summary.clientHelloRetransmit,
 		ACKs:                    summary.receivedACKs,
-		RecordsToACK:            c.takePendingACKs(),
+		// Replayed last-flight records are re-acknowledged: DTLS 1.3 recovery
+		// retransmits the ACK, DTLS 1.2 ignores record numbers and retransmits
+		// its last flight instead.
+		RecordsToACK: append(c.takePendingACKs(), summary.replayedHandshake...),
 	}
 	select {
 	case c.handshakeRecv <- received:
@@ -1881,6 +1889,9 @@ func (c *Conn) processDatagramPackets(ctx context.Context, pkts [][]byte, rAddr 
 		summary.clientHelloRetransmit = summary.clientHelloRetransmit || outcome.clientHelloRetransmit
 		if outcome.receivedACK != nil {
 			summary.receivedACKs = append(summary.receivedACKs, *outcome.receivedACK)
+		}
+		if outcome.replayedHandshake != nil {
+			summary.replayedHandshake = append(summary.replayedHandshake, *outcome.replayedHandshake)
 		}
 	}
 
@@ -2284,6 +2295,13 @@ func (c *Conn) prepareCiphertextPacket(buf []byte, rAddr net.Addr, bufferLease *
 
 	markPacketAsValid, ok := c.replayMarker(epoch, sequenceNumber, ^uint64(0))
 	if !ok {
+		if c.lastFlightReplay(innerPlaintext.RealType, epoch) {
+			return incomingPacketState{
+				replayedHandshake: true,
+				number:            protocol.RecordNumber{Epoch: epoch, SequenceNumber: sequenceNumber},
+			}, false, nil
+		}
+
 		return incomingPacketState{}, false, nil
 	}
 
@@ -2314,6 +2332,21 @@ func (c *Conn) handleFutureCiphertextPacket(epochLow uint8, remoteEpoch uint64, 
 			c.log.Debug("received ciphertext packet of next epoch, queuing packet")
 		}
 	}
+}
+
+// lastFlightReplay reports whether a replay-window drop must still reach the
+// handshake FSM. A last-flight retransmission that reuses its record number is
+// dropped as a duplicate; without this signal the state machine cannot run the
+// spec-defined recovery (RFC 6347 Section 4.2.4, RFC 9147 Section 5.8.1) and
+// the handshake stalls until timeout. Only authenticated-epoch handshake
+// records qualify once the handshake completed: plaintext-epoch replays stay
+// silently dropped, so unauthenticated input cannot trigger flight
+// retransmission, and DTLS 1.3 records are AEAD-verified before the replay
+// check. Responses to this signal are rate-limited by the peer-retransmit
+// backoff shared with the other recovery paths.
+func (c *Conn) lastFlightReplay(contentType protocol.ContentType, epoch uint64) bool {
+	return contentType == protocol.ContentTypeHandshake && epoch != 0 &&
+		c.isHandshakeCompletedSuccessfully()
 }
 
 // Apply replay checks for both record formats and restored state.
@@ -2442,6 +2475,13 @@ func (c *Conn) prepareLegacyContent(header recordlayer.ParsedRecord, buf []byte,
 	common := dtlsstate.CommonState(c.state)
 	markPacketAsValid, ok := c.replayMarker(uint64(header.Epoch()), header.SequenceNumber(), recordlayer.MaxSequenceNumber)
 	if !ok {
+		if c.lastFlightReplay(header.ContentType(), uint64(header.Epoch())) {
+			return incomingPacketState{
+				replayedHandshake: true,
+				number:            protocol.RecordNumber{Epoch: uint64(header.Epoch()), SequenceNumber: header.SequenceNumber()},
+			}, false, nil
+		}
+
 		return incomingPacketState{}, false, nil
 	}
 
@@ -2891,6 +2931,12 @@ func (c *Conn) handleIncomingPacket(ctx context.Context, buf []byte, rAddr net.A
 		return packetOutcome{}, err
 	}
 	if !ok {
+		if prepared.replayedHandshake {
+			number := prepared.number
+
+			return packetOutcome{replayedHandshake: &number}, nil
+		}
+
 		return packetOutcome{}, nil
 	}
 	prepared.markPacketAsValid = c.rrc.WrapReplayMarker(prepared.markPacketAsValid, rAddr, len(buf), c.RemoteAddr, c.cidPathMigrationPolicy == CIDPathMigrationRRC && dtlsstate.CommonState(c.state).RRCNegotiated)

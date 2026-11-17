@@ -271,6 +271,13 @@ func (s *fsm12) finish(ctx context.Context, c Conn) (State, error) {
 		if s.state.IsClient {
 			return StateFinished, nil
 		}
+		// Answering every retransmission of the peer's last flight with a full
+		// flight retransmission amplifies egress bandwidth linearly with loss.
+		// Throttle peer-initiated recovery like the flight 4/4b path does.
+		if time.Now().Before(s.peerRetransmitAfter) {
+			return StateFinished, nil
+		}
+		s.backoffPeerRetransmit()
 
 		return StateSending, nil
 	case <-ctx.Done():

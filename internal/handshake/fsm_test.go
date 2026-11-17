@@ -232,6 +232,61 @@ func TestHandshakeFSM12ClientHelloRecovery(t *testing.T) {
 	}
 }
 
+func TestHandshakeFSM12FinishedThrottlesLastFlightRetransmit(t *testing.T) {
+	newServerFSM := func() *fsm12 {
+		state := dtlsstate.NewState12(false)
+
+		return &fsm12{
+			currentFlight: dtlsflight12.Flight6, retransmit: true,
+			retransmitInterval: time.Second,
+			state:              &state, cache: dtlsflight.NewCache(),
+			cfg: &dtlsconfig.HandshakeConfig{InitialRetransmitInterval: time.Second},
+		}
+	}
+
+	t.Run("server", func(t *testing.T) {
+		fsm := newServerFSM()
+		conn := &flightTestConn{recvHandshake: make(chan RecvHandshakeState, 3)}
+		ctx := t.Context()
+
+		// The first retransmission of the peer's last flight is answered.
+		conn.recvHandshake <- RecvHandshakeState{Done: make(chan struct{})}
+		next, err := fsm.finish(ctx, conn)
+		require.NoError(t, err)
+		require.Equal(t, StateSending, next)
+		require.True(t, fsm.peerRetransmitAfter.After(time.Now()))
+
+		// Further retransmissions inside the backoff window are absorbed.
+		conn.recvHandshake <- RecvHandshakeState{Done: make(chan struct{})}
+		next, err = fsm.finish(ctx, conn)
+		require.NoError(t, err)
+		require.Equal(t, StateFinished, next)
+
+		// Once the window expires the next retransmission is answered again.
+		fsm.peerRetransmitAfter = time.Now().Add(-time.Second)
+		conn.recvHandshake <- RecvHandshakeState{Done: make(chan struct{})}
+		next, err = fsm.finish(ctx, conn)
+		require.NoError(t, err)
+		require.Equal(t, StateSending, next)
+	})
+
+	t.Run("client", func(t *testing.T) {
+		state := dtlsstate.NewState12(true)
+		fsm := &fsm12{
+			currentFlight: dtlsflight12.Flight6, retransmit: true,
+			retransmitInterval: time.Second,
+			state:              &state, cache: dtlsflight.NewCache(),
+			cfg: &dtlsconfig.HandshakeConfig{InitialRetransmitInterval: time.Second},
+		}
+		conn := &flightTestConn{recvHandshake: make(chan RecvHandshakeState, 1)}
+		conn.recvHandshake <- RecvHandshakeState{Done: make(chan struct{})}
+		next, err := fsm.finish(t.Context(), conn)
+		require.NoError(t, err)
+		require.Equal(t, StateFinished, next)
+		require.True(t, fsm.peerRetransmitAfter.IsZero())
+	})
+}
+
 func TestHandshakeFSMWaitCancellationResetsRetransmitInterval(t *testing.T) {
 	cfg := &dtlsconfig.HandshakeConfig{InitialRetransmitInterval: time.Second}
 	interval := 30 * time.Second
